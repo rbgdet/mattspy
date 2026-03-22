@@ -345,7 +345,8 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         return X, y
 
     def _partial_fit(self, n_epochs, X, y, classes=None):
-        if not getattr(self, "_is_fit", False):
+        was_fit = getattr(self, "_is_fit", False)
+        if not was_fit:
             X, y = self._init_from_json(X=X, y=y, classes=classes)
             self.loss_history_ = []
         else:
@@ -360,13 +361,13 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             y = jnp.array(y)
 
         kwargs = {k: v for k, v in (self.solver_kwargs or tuple())}
-        if not getattr(self, "_is_fit", False):
+        if not was_fit:
             # initialize optimizer only if first call to partial fit
             optimizer = getattr(optax, self.solver)(**kwargs)
             self._optimizer = optimizer
         else:
             optimizer = self._optimizer
-        if not getattr(self, "_is_fit", False):
+        if not was_fit:
             # initialize opt_state only if first call to partial fit
             self._opt_state = self._optimizer.init(self.params_)
             opt_state = self._opt_state

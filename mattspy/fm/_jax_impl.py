@@ -347,6 +347,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
     def _partial_fit(self, n_epochs, X, y, classes=None):
         if not getattr(self, "_is_fit", False):
             X, y = self._init_from_json(X=X, y=y, classes=classes)
+            self.loss_history_ = []
         else:
             if not (isinstance(X, jnp.ndarray) and isinstance(y, jnp.ndarray)):
                 X, y = validate_data(self, X=X, y=y, reset=False)
@@ -359,8 +360,19 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             y = jnp.array(y)
 
         kwargs = {k: v for k, v in (self.solver_kwargs or tuple())}
-        optimizer = getattr(optax, self.solver)(**kwargs)
-        opt_state = optimizer.init(self.params_)
+        if not getattr(self, "_is_fit", False):
+            # initialize optimizer only if first call to partial fit
+            optimizer = getattr(optax, self.solver)(**kwargs)
+            self._optimizer = optimizer
+        else:
+            optimizer = self._optimizer
+        if not getattr(self, "_is_fit", False):
+            # initialize opt_state only if first call to partial fit
+            self._opt_state = self._optimizer.init(self.params_)
+            opt_state = self._opt_state
+        else:
+            opt_state = self._opt_state
+
         new_value = None
 
         for _ in range(n_epochs):
@@ -374,17 +386,20 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                         end = min(start + self.batch_size, X.shape[0])
                         Xb = X[inds[start:end], :]
                         yb = y[inds[start:end]]
-                        grads = _grad_jax_loss_func(
+                        new_value, grads = _value_and_grad_jax_loss_func(
                             self.params_, Xb, yb, self.lambda_v, self.lambda_w
-                        )
+                            )
+                        self.loss_history_.append(new_value)
                         updates, opt_state = optimizer.update(
                             grads, opt_state, self.params_
                         )
                         new_params = optax.apply_updates(self.params_, updates)
+                        self.params_ = new_params
                 else:
-                    grads = _grad_jax_loss_func(
+                    new_value, grads = _value_and_grad_jax_loss_func(
                         self.params_, X, y, self.lambda_v, self.lambda_w
                     )
+                    self.loss_history_.append(new_value)
                     updates, opt_state = optimizer.update(
                         grads, opt_state, self.params_
                     )
@@ -398,6 +413,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                     self.lambda_w,
                     state=opt_state,
                 )
+                self.loss_history_.append(new_value)
                 updates, opt_state = optimizer.update(
                     grads,
                     opt_state,

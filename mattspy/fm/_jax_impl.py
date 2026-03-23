@@ -448,7 +448,8 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 break
 
             self.params_ = new_params
-
+       
+        self._opt_state = opt_state
         return self
 
     def predict_log_proba(self, X):

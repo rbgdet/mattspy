@@ -14,6 +14,8 @@ from sklearn.preprocessing import LabelEncoder
 
 from mattspy.json import EstimatorToFromJSONMixin
 
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
 
 @jax.jit
 def _lowrank_twoway_term(x, vmat):
@@ -80,7 +82,6 @@ def _jax_predict(params, X):
         axis=-1,
     )
 
-
 @jax.jit
 def _jax_loss_func(params, X, y, lambda_v, lambda_w):
     w0, w, vmat = params
@@ -100,17 +101,49 @@ def _jax_loss_func(params, X, y, lambda_v, lambda_w):
     )
     return loss
 
+devices = jax.devices()
+mesh = Mesh(devices, axis_names=('class_grid',))
+
+params_sharding = (
+    NamedSharding(mesh, P('class_grid',)), 
+    NamedSharding(mesh, P(None,'class_grid',)), 
+    NamedSharding(mesh, P(None, None, 'class_grid'))
+)
+
+X_sharding = NamedSharding(mesh, P(None, None))
+y_sharding = NamedSharding(mesh, P(None))
+
+lambda_v_sharding = NamedSharding(mesh, P())
+lambda_w_sharding = NamedSharding(mesh, P())
+
+sharding_tuple = (params_sharding, 
+                 X_sharding, 
+                 y_sharding, 
+                 lambda_v_sharding, 
+                 lambda_w_sharding)
 
 _value_and_grad_from_state_jax_loss_func = jax.jit(
     optax.value_and_grad_from_state(_jax_loss_func),
+    in_shardings=sharding_tuple,
 )
 _grad_jax_loss_func = jax.jit(
     jax.grad(_jax_loss_func),
+    in_shardings=sharding_tuple,
 )
 _value_and_grad_jax_loss_func = jax.jit(
     jax.value_and_grad(_jax_loss_func),
+    in_shardings=sharding_tuple,
 )
 
+@partial(jax.jit, static_argnames=("n_feat", "rank", "n_classes"), out_shardings=params_sharding)
+def _init_params_sharded(key, n_feat, rank, n_classes):
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    w0 = jax.random.normal(k1, shape=(n_classes,))
+    w = jax.random.normal(k2, shape=(n_feat, n_classes,))
+    vmat = jax.random.normal(k3, shape=(n_feat, rank, n_classes,))
+
+    return (w0, w, vmat)
 
 def _call_in_batches_maybe(self, func, X):
     if self.batch_size is not None:
@@ -330,15 +363,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 X, y = self._init_jax(X, y, classes=classes)
 
         if "params_" not in kwargs:
-            self._jax_rng_key, subkey = jax.random.split(self._jax_rng_key)
-            w0 = jax.random.normal(subkey, shape=(self.n_classes_))
-            self._jax_rng_key, subkey = jax.random.split(self._jax_rng_key)
-            w = jax.random.normal(subkey, shape=(self.n_features_in_, self.n_classes_))
-            self._jax_rng_key, subkey = jax.random.split(self._jax_rng_key)
-            vmat = jax.random.normal(
-                subkey, shape=(self.n_features_in_, self.rank, self.n_classes_)
-            )
-            self.params_ = (w0, w, vmat)
+            self.params_ = _init_params_sharded(self._jax_rng_key, self.n_features_in_, self.rank, self.n_classes_)
         else:
             self.params_ = kwargs["params_"]
 

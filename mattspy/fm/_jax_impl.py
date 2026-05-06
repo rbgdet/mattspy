@@ -17,16 +17,18 @@ from mattspy.json import EstimatorToFromJSONMixin
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
-@jax.jit
 def _lowrank_twoway_term(x, vmat):
     fterm = jnp.einsum("np,pk...->nk...", x, vmat)
     sterm = jnp.einsum("np,pk...->nk...", x**2, vmat**2)
     return 0.5 * jnp.sum(fterm**2 - sterm, axis=1)
 
 
+_checkpoint_twoway = jax.checkpoint(_lowrank_twoway_term)
+
+
 @jax.jit
 def _fm_eval(x, w0, w, vmat):
-    return w0 + jnp.einsum("np,p...->n...", x, w) + _lowrank_twoway_term(x, vmat)
+    return w0 + jnp.einsum("np,p...->n...", x, w) + _checkpoint_twoway(x, vmat)
 
 
 @partial(jax.jit, static_argnames=("n_features", "rank", "n_classes"))
@@ -82,6 +84,7 @@ def _jax_predict(params, X):
         axis=-1,
     )
 
+
 @jax.jit
 def _jax_loss_func(params, X, y, lambda_v, lambda_w):
     w0, w, vmat = params
@@ -101,13 +104,25 @@ def _jax_loss_func(params, X, y, lambda_v, lambda_w):
     )
     return loss
 
+
 devices = jax.devices()
-mesh = Mesh(devices, axis_names=('class_grid',))
+mesh = Mesh(devices, axis_names=("class_grid",))
 
 params_sharding = (
-    NamedSharding(mesh, P('class_grid',)), 
-    NamedSharding(mesh, P(None,'class_grid',)), 
-    NamedSharding(mesh, P(None, None, 'class_grid'))
+    NamedSharding(
+        mesh,
+        P(
+            "class_grid",
+        ),
+    ),
+    NamedSharding(
+        mesh,
+        P(
+            None,
+            "class_grid",
+        ),
+    ),
+    NamedSharding(mesh, P(None, None, "class_grid")),
 )
 
 X_sharding = NamedSharding(mesh, P(None, None))
@@ -116,11 +131,13 @@ y_sharding = NamedSharding(mesh, P(None))
 lambda_v_sharding = NamedSharding(mesh, P())
 lambda_w_sharding = NamedSharding(mesh, P())
 
-sharding_tuple = (params_sharding, 
-                 X_sharding, 
-                 y_sharding, 
-                 lambda_v_sharding, 
-                 lambda_w_sharding)
+sharding_tuple = (
+    params_sharding,
+    X_sharding,
+    y_sharding,
+    lambda_v_sharding,
+    lambda_w_sharding,
+)
 
 _value_and_grad_from_state_jax_loss_func = jax.jit(
     optax.value_and_grad_from_state(_jax_loss_func),
@@ -135,15 +152,34 @@ _value_and_grad_jax_loss_func = jax.jit(
     in_shardings=sharding_tuple,
 )
 
-@partial(jax.jit, static_argnames=("n_feat", "rank", "n_classes"), out_shardings=params_sharding)
+
+@partial(
+    jax.jit,
+    static_argnames=("n_feat", "rank", "n_classes"),
+    out_shardings=params_sharding,
+)
 def _init_params_sharded(key, n_feat, rank, n_classes):
     k1, k2, k3 = jax.random.split(key, 3)
 
     w0 = jax.random.normal(k1, shape=(n_classes,))
-    w = jax.random.normal(k2, shape=(n_feat, n_classes,))
-    vmat = jax.random.normal(k3, shape=(n_feat, rank, n_classes,))
+    w = jax.random.normal(
+        k2,
+        shape=(
+            n_feat,
+            n_classes,
+        ),
+    )
+    vmat = jax.random.normal(
+        k3,
+        shape=(
+            n_feat,
+            rank,
+            n_classes,
+        ),
+    )
 
     return (w0, w, vmat)
+
 
 def _call_in_batches_maybe(self, func, X):
     if self.batch_size is not None:
@@ -363,7 +399,9 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 X, y = self._init_jax(X, y, classes=classes)
 
         if "params_" not in kwargs:
-            self.params_ = _init_params_sharded(self._jax_rng_key, self.n_features_in_, self.rank, self.n_classes_)
+            self.params_ = _init_params_sharded(
+                self._jax_rng_key, self.n_features_in_, self.rank, self.n_classes_
+            )
         else:
             self.params_ = kwargs["params_"]
 
@@ -402,6 +440,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         new_value = None
 
         for _ in range(n_epochs):
+            prev_params = self.params_
             value = new_value
 
             if self.solver not in ["lbfgs"]:
@@ -414,7 +453,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                         yb = y[inds[start:end]]
                         new_value, grads = _value_and_grad_jax_loss_func(
                             self.params_, Xb, yb, self.lambda_v, self.lambda_w
-                            )
+                        )
                         self.loss_history_.append(new_value)
                         updates, opt_state = optimizer.update(
                             grads, opt_state, self.params_
@@ -461,7 +500,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 all(
                     [
                         jnp.allclose(new_p, p, atol=self.atol, rtol=self.rtol)
-                        for new_p, p in zip(new_params, self.params_)
+                        for new_p, p in zip(new_params, prev_params)
                     ]
                 )
                 or (
@@ -473,8 +512,9 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 break
 
             self.params_ = new_params
-       
+
         self._opt_state = opt_state
+        self._is_fit = True
         return self
 
     def predict_log_proba(self, X):

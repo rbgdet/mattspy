@@ -18,11 +18,19 @@ def _lowrank_twoway_term(x, vmat):
 
     fterm = mx.einsum("np,pkc->nkc", x_bf, vmat_bf).astype(mx.float32)
     sterm = mx.einsum("np,pkc->nkc", x_bf**2, vmat_bf**2).astype(mx.float32)
+    # P, K, C = vmat_bf.shape
+
+    # vmat_flat = vmat_bf.reshape(P, K * C)
+    # vmat_sq_flat = (vmat_bf**2).reshape(P, K * C)
+
+    # fterm = mx.matmul(x_bf, vmat_flat).reshape(-1, K, C).astype(mx.float32)
+    # sterm = mx.matmul(x_bf**2, vmat_sq_flat).reshape(-1, K, C).astype(mx.float32)
     return 0.5 * mx.sum(fterm**2 - sterm,
                          axis=1)
 
 
 def _linear_term(x, w):
+    # return mx.matmul(x, w)
     return mx.einsum("np,p...->n...", x, w)
 
 
@@ -138,7 +146,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
     init_scale : float, optional
         The RMS of the Gaussian parameter initialization.
     solver : str, optional
-        The solver the use from the `optax` package.
+        The solver the use for optimization.
     solver_kwargs : tuple of key-value pairs, optional
         An optional tuple of tuples of keyword arguments to pass to the solver.
     atol : float, optional
@@ -148,7 +156,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
     max_iter : int, optional
         the maximum number of steps to take if `batch_size` is None.
     backend : str, optional
-        The computational backend to use. Only "jax" is currently available.
+        The computational backend to use. Only "mlx" is currently available.
 
     Attributes
     ----------
@@ -181,12 +189,12 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         lambda_v=0,
         lambda_w=0,
         init_scale=0.1,
-        solver="lion",
+        solver="Lion",
         solver_kwargs=(("learning_rate", 1e-2),),
         atol=1e-4,
         rtol=1e-4,
         max_iter=1000,
-        backend="jax",
+        backend="mlx",
     ):
         self.rank = rank
         self.random_state = random_state
@@ -218,9 +226,9 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         """
 
         self._is_fit = False
-        return self._partial_fit(self.max_iter, X, y)
+        return self._partial_fit(X, y, n_epochs=self.max_iter)
 
-    def partial_fit(self, X, y, classes=None, check_convergence=False):
+    def partial_fit(self, X, y, classes=None):
         """Fit the FM to data `X` and `y` for a single epoch.
 
         Parameters
@@ -233,11 +241,6 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             If given, an optional array of unique class labels
             that is used instead of extracting them from the input
             `y`.
-        check_convergence : bool, optional
-            If True, checks for convergence after this partial fit. Default is False.
-            Note that it can incur additional computational and memorycost as it
-            requires checking the convergence criteria after this partial fit,
-            so not ideal for external mini-batch updates.
 
 
         Returns
@@ -245,9 +248,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         self : object
             The fit estimator.
         """
-        return self._partial_fit(1, X, y,
-                                 classes=classes,
-                                 check_convergence=check_convergence)
+        return self._partial_fit(X, y, classes=classes)
 
     def _init_numpy(self, X, y, classes=None):
         X, y = validate_data(self, X=X, y=y, reset=True)
@@ -321,7 +322,8 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
 
         if "params_" not in kwargs:
             self._mlx_rng_key, subkey = mx.random.split(self._mlx_rng_key)
-            w0 = self.init_scale * mx.random.normal(shape=(self.n_classes_,), key=subkey)
+            w0 = self.init_scale * mx.random.normal(shape=(self.n_classes_,),
+                                                    key=subkey)
             self._mlx_rng_key, subkey = mx.random.split(self._mlx_rng_key)
             w = self.init_scale * mx.random.normal(shape=(self.n_features_in_,
                                                           self.n_classes_,),
@@ -341,23 +343,23 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
 
         return X, y
 
-    def _partial_fit(self, n_epochs, X, y, classes=None, check_convergence=False):
+    def _partial_fit(self, X, y, classes=None, n_epochs=1):
         was_fit = getattr(self, "_is_fit", False)
         if not was_fit:
             X, y = self._init_from_json(X=X, y=y, classes=classes)
             self.loss_history_ = []
-
-            kwargs = dict(self.solver_kwargs or tuple())
-            opt_class = getattr(optim, self.solver, None)(**kwargs)
-            if opt_class is None:
-                raise ValueError(
-                    f"Unknown solver {self.solver!r}.\
-                          Available: {[n for n in dir(optim) if not n.startswith('_')]}"
-                )
-            if isinstance(opt_class, type):
-                self._optimizer = opt_class(**kwargs)
-            else:
-                self._optimizer = opt_class
+            if not hasattr(self, "_optimizer"):
+                kwargs = dict(self.solver_kwargs or tuple())
+                opt_class = getattr(optim, self.solver, None)
+                if opt_class is None:
+                    raise ValueError(
+                        f"Unknown solver {self.solver!r}. Available:\
+                              {[n for n in dir(optim) if not n.startswith('_')]}"
+                    )
+                if isinstance(opt_class, type):
+                    self._optimizer = opt_class(**kwargs)
+                else:
+                    self._optimizer = opt_class
         else:
             if isinstance(X, mx.array):
                 y = mx.round(y).astype(mx.int32)
@@ -367,48 +369,55 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 X = mx.array(X)
 
         for _ in range(n_epochs):
-            prev_params = self.params_
+            #prev_params = self.params_
 
             if self.batch_size is not None:
                 self._mlx_rng_key, subkey = mx.random.split(self._mlx_rng_key)
                 inds = mx.random.permutation(subkey, X.shape[0])
-
+                X = X[inds, :]
+                y = y[inds]
                 for start in range(0, X.shape[0], self.batch_size):
                     end = min(start + self.batch_size, X.shape[0])
-                    Xb = X[inds[start:end], :]
-                    yb = y[inds[start:end]]
+                    Xb = X[start:end, :]
+                    yb = y[start:end]
 
                     new_value, grads = _value_and_grad_mlx_loss_func(
                         self.params_, Xb, yb, self.lambda_v, self.lambda_w
                     )
-                    self.loss_history_.append(new_value.item())
+                    self.loss_history_.append(new_value)
 
                     self.params_ = self._optimizer.apply_gradients(grads, self.params_)
-                    mx.eval(self.params_, self._optimizer.state)
+                    mx.eval(self.params_, self._optimizer.state, new_value)
             else:
                 X = mx.array(X)
                 y = mx.array(y)
                 new_value, grads = _value_and_grad_mlx_loss_func(
                     self.params_, X, y, self.lambda_v, self.lambda_w
                 )
-                self.loss_history_.append(new_value.item())
+                self.loss_history_.append(new_value)
 
                 self.params_ = self._optimizer.apply_gradients(grads, self.params_)
-                mx.eval(self.params_, self._optimizer.state)
+                mx.eval(self.params_, self._optimizer.state, new_value)
 
             self.n_iter_ += 1
 
-            if check_convergence:
-                if self.n_iter_ > 1 and (
-                    mx.all(
-                        mx.array([
-                            mx.allclose(new_p, p, atol=self.atol, rtol=self.rtol)
-                            for new_p, p in zip(self.params_, prev_params)
-                        ])
-                    )
-                ):
-                    self.converged_ = True
-                    break
+            # if self.batch_size is not None:
+            #     if self.n_iter_ > 1 and (
+            #         mx.all(
+            #             mx.array([
+            #                 mx.allclose(new_p, p, atol=self.atol, rtol=self.rtol)
+            #                 for new_p, p in zip(self.params_.values(),
+            #                                     prev_params.values())
+            #             ])
+            #         )
+            #     ):
+            #         self.converged_ = True
+            #         break
+
+        # self.loss_history_ = [
+        #     float(loss) if isinstance(loss, mx.array) else loss
+        #     for loss in self.loss_history_
+        # ]
 
         self._is_fit = True
         return self

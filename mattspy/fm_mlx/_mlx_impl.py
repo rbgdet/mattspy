@@ -12,30 +12,34 @@ from sklearn.preprocessing import LabelEncoder
 from mattspy.json import EstimatorToFromJSONMixin
 
 
-def _lowrank_twoway_term(x, vmat):
-    x_bf = x.astype(mx.bfloat16)
-    vmat_bf = vmat.astype(mx.bfloat16)
+def _lowrank_twoway_term(X_cols, X_data, vmat):
+    # X_data shape (n_rows, n_nonzero)
+    # remember n_nonzero is placeholder for column indices of non-zero entries
+    vmat_sparse = vmat[X_cols]
+    # shape (n_rows, n_nonzero, rank, n_classes)
 
-    fterm = mx.einsum("np,pkc->nkc", x_bf, vmat_bf).astype(mx.float32)
-    sterm = mx.einsum("np,pkc->nkc", x_bf**2, vmat_bf**2).astype(mx.float32)
-    # P, K, C = vmat_bf.shape
+    fterm = mx.einsum("np,npkc->nkc", X_data, vmat_sparse).astype(mx.float32)
+    sterm = mx.einsum("np,npkc->nkc", X_data**2, vmat_sparse**2).astype(mx.float32)
 
-    # vmat_flat = vmat_bf.reshape(P, K * C)
-    # vmat_sq_flat = (vmat_bf**2).reshape(P, K * C)
-
-    # fterm = mx.matmul(x_bf, vmat_flat).reshape(-1, K, C).astype(mx.float32)
-    # sterm = mx.matmul(x_bf**2, vmat_sq_flat).reshape(-1, K, C).astype(mx.float32)
     return 0.5 * mx.sum(fterm**2 - sterm,
                          axis=1)
 
 
-def _linear_term(x, w):
+def _linear_term(X_cols, X_data, w):
     # return mx.matmul(x, w)
-    return mx.einsum("np,p...->n...", x, w)
+    w_sparse = w[X_cols]  # shape (n_rows, n_nonzero, n_classes)
+    # X_data.shape (n_rows, n_nonzero)
+    return mx.einsum("np,np...->n...", X_data, w_sparse)
 
 
 def _fm_eval(x, w0, w, vmat):
-    return w0 + _linear_term(x, w) + _lowrank_twoway_term(x, vmat)
+    X_cols, X_data = x
+    return w0 + _linear_term(X_cols,
+                             X_data,
+                             w) \
+            + _lowrank_twoway_term(X_cols,
+                                   X_data,
+                                   vmat)
 
 
 @mx.compile
@@ -107,9 +111,17 @@ _value_and_grad_mlx_loss_func = mx.compile(
 def _call_in_batches_maybe(self, func, X):
     if self.batch_size is not None:
         vals = []
-        for start in range(0, X.shape[0], self.batch_size):
-            end = min(start + self.batch_size, X.shape[0])
-            Xb = X[start:end, :]
+        # Determine total samples depending on type
+        n_samples = X[0].shape[0] if isinstance(X, tuple) else X.shape[0]
+
+        for start in range(0, n_samples, self.batch_size):
+            end = min(start + self.batch_size, n_samples)
+
+            if isinstance(X, tuple):
+                Xb = (X[0][start:end], X[1][start:end])
+            else:
+                Xb = X[start:end, :]
+
             vals.append(func(self.params_, Xb))
         return mx.concatenate(vals, axis=0)
     else:
@@ -195,6 +207,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         rtol=1e-4,
         max_iter=1000,
         backend="mlx",
+        n_features=None,
     ):
         self.rank = rank
         self.random_state = random_state
@@ -208,6 +221,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         self.rtol = rtol
         self.max_iter = max_iter
         self.backend = backend
+        self.n_features = n_features
 
     def fit(self, X, y):
         """Fit the FM to data `X` and `y`.
@@ -317,6 +331,15 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         else:
             if isinstance(X, mx.array) and isinstance(y, mx.array):
                 X, y = self._init_mlx(X, y, classes=classes)
+            elif isinstance(X, tuple):
+                y_np = np.array(y)
+                if classes is not None:
+                    self._label_encoder = _LabelEncoder().fit(np.array(classes))
+                else:
+                    self._label_encoder = _LabelEncoder().fit(y_np)
+                self.classes_ = self._label_encoder.classes_
+                self.n_classes_ = len(self.classes_)
+                y = mx.array(self._label_encoder.transform(y_np))
             else:
                 X, y = self._init_numpy(X, y, classes=classes)
 
@@ -346,6 +369,9 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
     def _partial_fit(self, X, y, classes=None, n_epochs=1):
         was_fit = getattr(self, "_is_fit", False)
         if not was_fit:
+            # self.n_features_in_ set manually if X is a tuple
+            if isinstance(X, tuple):
+                self.n_features_in_ = self.n_features
             X, y = self._init_from_json(X=X, y=y, classes=classes)
             self.loss_history_ = []
             if not hasattr(self, "_optimizer"):
@@ -363,22 +389,35 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         else:
             if isinstance(X, mx.array):
                 y = mx.round(y).astype(mx.int32)
+            elif isinstance(X, tuple):
+                if not isinstance(y, mx.array):
+                    y = mx.array(y)
+                y = mx.round(y).astype(mx.int32)
             else:
                 # Fallback
                 y = mx.array(self._label_encoder.transform(y))
                 X = mx.array(X)
 
         for _ in range(n_epochs):
-            #prev_params = self.params_
 
             if self.batch_size is not None:
                 self._mlx_rng_key, subkey = mx.random.split(self._mlx_rng_key)
-                inds = mx.random.permutation(subkey, X.shape[0])
-                X = X[inds, :]
+
+                # Get total samples based on input type
+                n_samples = X[0].shape[0] if isinstance(X, tuple) else X.shape[0]
+                inds = mx.random.permutation(subkey, n_samples)
+
+                if isinstance(X, tuple):
+                    X = (X[0][inds], X[1][inds])
+                else:
+                    X = X[inds, :]
                 y = y[inds]
-                for start in range(0, X.shape[0], self.batch_size):
-                    end = min(start + self.batch_size, X.shape[0])
-                    Xb = X[start:end, :]
+                for start in range(0, n_samples, self.batch_size):
+                    end = min(start + self.batch_size, n_samples)
+                    if isinstance(X, tuple):
+                        Xb = (X[0][start:end], X[1][start:end])
+                    else:
+                        Xb = X[start:end, :]
                     yb = y[start:end]
 
                     new_value, grads = _value_and_grad_mlx_loss_func(
@@ -389,8 +428,10 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                     self.params_ = self._optimizer.apply_gradients(grads, self.params_)
                     mx.eval(self.params_, self._optimizer.state, new_value)
             else:
-                X = mx.array(X)
-                y = mx.array(y)
+                # Non-batched path: only convert raw NumPy arrays/lists
+                if not (isinstance(X, mx.array) or isinstance(X, tuple)):
+                    X = mx.array(X)
+                    y = mx.array(y)
                 new_value, grads = _value_and_grad_mlx_loss_func(
                     self.params_, X, y, self.lambda_v, self.lambda_w
                 )
@@ -400,24 +441,6 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                 mx.eval(self.params_, self._optimizer.state, new_value)
 
             self.n_iter_ += 1
-
-            # if self.batch_size is not None:
-            #     if self.n_iter_ > 1 and (
-            #         mx.all(
-            #             mx.array([
-            #                 mx.allclose(new_p, p, atol=self.atol, rtol=self.rtol)
-            #                 for new_p, p in zip(self.params_.values(),
-            #                                     prev_params.values())
-            #             ])
-            #         )
-            #     ):
-            #         self.converged_ = True
-            #         break
-
-        # self.loss_history_ = [
-        #     float(loss) if isinstance(loss, mx.array) else loss
-        #     for loss in self.loss_history_
-        # ]
 
         self._is_fit = True
         return self
@@ -437,7 +460,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             else `(n_samples)`.
         """
 
-        if not isinstance(X, (mx.array)):
+        if not (isinstance(X, mx.array) or isinstance(X, tuple)):
             X = validate_data(self, X=X, reset=False)
             X = mx.array(X)
 
@@ -462,7 +485,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             else `(n_samples)`.
         """
 
-        if not isinstance(X, (mx.array)):
+        if not (isinstance(X, mx.array) or isinstance(X, tuple)):
             X = validate_data(self, X=X, reset=False)
             X = mx.array(X)
         if not getattr(self, "_is_fit", False):
@@ -485,7 +508,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             An array of labels of shape `(n_samples)`.
         """
 
-        if not isinstance(X, (mx.array)):
+        if not (isinstance(X, mx.array) or isinstance(X, tuple)):
             X = validate_data(self, X=X, reset=False)
             X = mx.array(X)
         if not getattr(self, "_is_fit", False):

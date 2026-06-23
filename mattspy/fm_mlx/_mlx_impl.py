@@ -339,7 +339,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                     self._label_encoder = _LabelEncoder().fit(y_np)
                 self.classes_ = self._label_encoder.classes_
                 self.n_classes_ = len(self.classes_)
-                y = mx.array(self._label_encoder.transform(y_np))
+                y_np = mx.array(self._label_encoder.transform(y_np))
             else:
                 X, y = self._init_numpy(X, y, classes=classes)
 

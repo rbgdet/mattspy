@@ -1,10 +1,10 @@
 import mlx.core as mx
 import mlx.optimizers as optim
+import mlx_sparse as ms
 import numpy as np
 import mlx.nn as nn
 from sklearn.base import ClassifierMixin, BaseEstimator
 from sklearn.utils import check_random_state
-from sklearn.utils.validation import validate_data
 from sklearn.utils.multiclass import type_of_target
 from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import LabelEncoder
@@ -12,34 +12,54 @@ from sklearn.preprocessing import LabelEncoder
 from mattspy.json import EstimatorToFromJSONMixin
 
 
-def _lowrank_twoway_term(X_cols, X_data, vmat):
-    # X_data shape (n_rows, n_nonzero)
-    # remember n_nonzero is placeholder for column indices of non-zero entries
-    vmat_sparse = vmat[X_cols]
-    # shape (n_rows, n_nonzero, rank, n_classes)
+def _serialize_if_sparse(X):
+    if isinstance(X, ms.CSRArray):
+        return {"type": "csr", "data": X.data, "indices": X.indices, "indptr": X.indptr, "shape": X.shape}
+    elif isinstance(X, ms.COOArray):
+        return {"type": "coo", "data": X.data, "row": X.row, "col": X.col, "shape": X.shape}
+    return X
 
-    fterm = mx.einsum("np,npkc->nkc", X_data, vmat_sparse).astype(mx.float32)
-    sterm = mx.einsum("np,npkc->nkc", X_data**2, vmat_sparse**2).astype(mx.float32)
 
+def _reconstruct_if_sparse(X):
+    if isinstance(X, dict) and "type" in X:
+        if X["type"] == "csr":
+            return ms.csr_array((X["data"], X["indices"], X["indptr"]), shape=X["shape"])
+        elif X["type"] == "coo":
+            return ms.coo_array((X["data"], (X["row"], X["col"])), shape=X["shape"])
+    return X
+
+def _square_sparse(X):
+    if isinstance(X, ms.CSRArray):
+        return ms.csr_array((X.data**2, X.indices, X.indptr), shape=X.shape)
+    elif isinstance(X, ms.COOArray):
+        return ms.coo_array((X.data**2, (X.row, X.col)), shape=X.shape)
+    return X**2
+
+
+def _lowrank_twoway_term(X, vmat):
+    # fterm = mx.einsum("np,npkc->nkc", X_data, vmat_sparse).astype(mx.float32)
+    # sterm = mx.einsum("np,npkc->nkc", X_data**2, vmat_sparse**2).astype(mx.float32)
+    vmat_f = vmat.reshape(vmat.shape[0], -1)
+    X_sq = _square_sparse(X)
+    fterm = (X @ vmat_f).astype(mx.float32).reshape(X.shape[0],
+                                                    vmat.shape[1],
+                                                    vmat.shape[2])
+    sterm = (X_sq @ vmat_f**2).astype(mx.float32).reshape(X.shape[0],
+                                                          vmat.shape[1],
+                                                          vmat.shape[2])
     return 0.5 * mx.sum(fterm**2 - sterm,
                          axis=1)
 
 
 def _linear_term(X_cols, X_data, w):
-    # return mx.matmul(x, w)
-    w_sparse = w[X_cols]  # shape (n_rows, n_nonzero, n_classes)
-    # X_data.shape (n_rows, n_nonzero)
-    return mx.einsum("np,np...->n...", X_data, w_sparse)
+    X_cols = X_cols.reshape(-1, 19)
+    X_data = X_data.reshape(-1, 19)
+    w_sparse = w[X_cols]
+    return w_sparse.T @ X_data
 
 
-def _fm_eval(x, w0, w, vmat):
-    X_cols, X_data = x
-    return w0 + _linear_term(X_cols,
-                             X_data,
-                             w) \
-            + _lowrank_twoway_term(X_cols,
-                                   X_data,
-                                   vmat)
+def _fm_eval(X, w0, w, vmat):
+    return w0 + X @ w + _lowrank_twoway_term(X, vmat)
 
 
 @mx.compile
@@ -68,6 +88,7 @@ def _combine_fm_params(w0, w, vmat):
 @mx.compile
 def _mlx_logits(params, X):
     w0, w, vmat = params["w0"], params["w"], params["vmat"]
+    X = _reconstruct_if_sparse(X)
     logits = _fm_eval(X, w0, w, vmat)
     return logits
 
@@ -87,6 +108,7 @@ _mlx_predict = mx.compile(
 
 def _mlx_loss_func(params, X, y, lambda_v, lambda_w):
     w0, w, vmat = params["w0"], params["w"], params["vmat"]
+    X = _reconstruct_if_sparse(X)
     logits = _fm_eval(X, w0, w, vmat)
 
     loss = mx.mean(nn.losses.cross_entropy(logits, y))
@@ -122,10 +144,12 @@ def _call_in_batches_maybe(self, func, X):
             else:
                 Xb = X[start:end, :]
 
-            vals.append(func(self.params_, Xb))
+            Xb_serialized = _serialize_if_sparse(Xb)
+            vals.append(func(self.params_, Xb_serialized))
         return mx.concatenate(vals, axis=0)
     else:
-        return func(self.params_, X)
+        Xb_serialized = _serialize_if_sparse(X)
+        return func(self.params_, Xb_serialized)
 
 
 class _LabelEncoder(EstimatorToFromJSONMixin, LabelEncoder):
@@ -265,7 +289,6 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         return self._partial_fit(X, y, classes=classes)
 
     def _init_numpy(self, X, y, classes=None):
-        X, y = validate_data(self, X=X, y=y, reset=True)
 
         tot = type_of_target(y, raise_unknown=True)
         if tot not in ["binary", "multiclass"]:
@@ -289,13 +312,6 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         else:
             self.classes_ = mx.unique(y)
         self.n_classes_ = len(self.classes_)
-
-        validate_data(
-            self,
-            X=np.ones((1, X.shape[1])),
-            y=np.ones(1, dtype=np.int32),
-            reset=True,
-        )
 
         if not mx.array_equal(mx.arange(self.n_classes_), self.classes_):
             raise ValueError(
@@ -339,7 +355,7 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                     self._label_encoder = _LabelEncoder().fit(y_np)
                 self.classes_ = self._label_encoder.classes_
                 self.n_classes_ = len(self.classes_)
-                y_np = mx.array(self._label_encoder.transform(y_np))
+                y = mx.array(self._label_encoder.transform(y_np))
             else:
                 X, y = self._init_numpy(X, y, classes=classes)
 
@@ -368,10 +384,18 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
 
     def _partial_fit(self, X, y, classes=None, n_epochs=1):
         was_fit = getattr(self, "_is_fit", False)
+
         if not was_fit:
             # self.n_features_in_ set manually if X is a tuple
             if isinstance(X, tuple):
-                self.n_features_in_ = self.n_features
+                if self.n_features is None:
+                    # Infer n_features from sparse column indices
+                    # X[0] is (rows, cols), so X[0][1] is cols
+                    self.n_features_in_ = int(mx.max(X[0][1])) + 1
+                else:
+                    self.n_features_in_ = self.n_features
+            elif isinstance(X, (ms.COOArray, ms.CSRArray)):
+                self.n_features_in_ = X.shape[1]
             X, y = self._init_from_json(X=X, y=y, classes=classes)
             self.loss_history_ = []
             if not hasattr(self, "_optimizer"):
@@ -392,6 +416,8 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             elif isinstance(X, tuple):
                 if not isinstance(y, mx.array):
                     y = mx.array(y)
+                y = mx.round(y).astype(mx.int32)
+            elif isinstance(X, (ms.COOArray, ms.CSRArray)):
                 y = mx.round(y).astype(mx.int32)
             else:
                 # Fallback
@@ -429,12 +455,17 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
                     mx.eval(self.params_, self._optimizer.state, new_value)
             else:
                 # Non-batched path: only convert raw NumPy arrays/lists
-                if not (isinstance(X, mx.array) or isinstance(X, tuple)):
+                if isinstance(X, (ms.COOArray, ms.CSRArray)):
+                    y = mx.round(y).astype(mx.int32)
+                elif not isinstance(X, (mx.array, tuple)):
                     X = mx.array(X)
-                    y = mx.array(y)
+                    y = mx.round(y).astype(mx.int32)
+
+                X_serialized = _serialize_if_sparse(X)
                 new_value, grads = _value_and_grad_mlx_loss_func(
-                    self.params_, X, y, self.lambda_v, self.lambda_w
+                    self.params_, X_serialized, y, self.lambda_v, self.lambda_w
                 )
+
                 self.loss_history_.append(new_value)
 
                 self.params_ = self._optimizer.apply_gradients(grads, self.params_)
@@ -461,9 +492,10 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         """
 
         if not (isinstance(X, mx.array) or isinstance(X, tuple)):
-            X = validate_data(self, X=X, reset=False)
-            X = mx.array(X)
-
+            if hasattr(X, 'indices') and hasattr(X, 'data'):
+                X = (X.indices, X.data)
+            else:
+                X = mx.array(X)
         if not getattr(self, "_is_fit", False):
             raise NotFittedError(
                 "FMClassifier must be fit before calling `predict_log_proba`!"
@@ -485,9 +517,11 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
             else `(n_samples)`.
         """
 
-        if not (isinstance(X, mx.array) or isinstance(X, tuple)):
-            X = validate_data(self, X=X, reset=False)
-            X = mx.array(X)
+        # if not (isinstance(X, mx.array) or isinstance(X, tuple)):
+        #     if hasattr(X, 'indices') and hasattr(X, 'data'):
+        #         X = (X.indices, X.data)
+        #     else:
+        #         X = mx.array(X)
         if not getattr(self, "_is_fit", False):
             raise NotFittedError(
                 "FMClassifier must be fit before calling `predict_proba`!"
@@ -509,8 +543,10 @@ class FMClassifier(EstimatorToFromJSONMixin, ClassifierMixin, BaseEstimator):
         """
 
         if not (isinstance(X, mx.array) or isinstance(X, tuple)):
-            X = validate_data(self, X=X, reset=False)
-            X = mx.array(X)
+            if hasattr(X, 'indices') and hasattr(X, 'data'):
+                X = (X.indices, X.data)
+            else:
+                X = mx.array(X)
         if not getattr(self, "_is_fit", False):
             raise NotFittedError("FMClassifier must be fit before calling `predict`!")
 
